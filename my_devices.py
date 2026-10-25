@@ -680,6 +680,23 @@ def xbox_read_xinput(_iface: Optional[HidIface] = None) -> Reading:
         info = XINPUT_BATTERY_INFORMATION()
         code = int(lib.XInputGetBatteryInformation(
             slot, XINPUT_BATTERY_DEVTYPE_GAMEPAD, ctypes.byref(info)))
+        # 刚换电池或手柄刚唤醒时，XInput 偶尔会先返回
+        # BATTERY_TYPE_DISCONNECTED，稍后才会补上真实电池类型。
+        # 仅在设备本身已连接时短暂重试，避免为未连接槽位增加开销。
+        if state_code == 0 and (code != 0 or int(info.BatteryType) in
+                                (XINPUT_BATTERY_TYPE_DISCONNECTED,
+                                 XINPUT_BATTERY_TYPE_UNKNOWN)):
+            for _ in range(3):
+                time.sleep(0.12)
+                retry_info = XINPUT_BATTERY_INFORMATION()
+                retry_code = int(lib.XInputGetBatteryInformation(
+                    slot, XINPUT_BATTERY_DEVTYPE_GAMEPAD,
+                    ctypes.byref(retry_info)))
+                code, info = retry_code, retry_info
+                if (code == 0 and int(info.BatteryType) not in
+                        (XINPUT_BATTERY_TYPE_DISCONNECTED,
+                         XINPUT_BATTERY_TYPE_UNKNOWN)):
+                    break
         if state_code != 0 and code == ERROR_DEVICE_NOT_CONNECTED:
             continue
         if state_code == 0 and code != 0:
@@ -687,7 +704,9 @@ def xbox_read_xinput(_iface: Optional[HidIface] = None) -> Reading:
                 ok=False, present=True, status="battery_unavailable",
                 source=source,
                 detail=(f"XInput 槽位 {slot + 1}；手柄已连接，"
-                        f"但电池接口返回错误码 {code}"))
+                        f"但电池接口暂时返回错误码 {code}；"
+                        "请轻按手柄按键，程序会自动重试"),
+                xinput_slot=slot)
         if code != 0:
             last_error = code
             continue
@@ -698,7 +717,9 @@ def xbox_read_xinput(_iface: Optional[HidIface] = None) -> Reading:
                     ok=False, present=True, status="battery_unavailable",
                     source=source,
                     detail=(f"XInput 槽位 {slot + 1}；手柄已连接，"
-                            "但当前电池组未上报电量（兼容性限制）"))
+                            "但本轮未返回电池状态；请轻按手柄按键，"
+                            "程序会自动重试"),
+                    xinput_slot=slot)
             continue
         if battery_type == XINPUT_BATTERY_TYPE_WIRED:
             return Reading(
@@ -708,8 +729,9 @@ def xbox_read_xinput(_iface: Optional[HidIface] = None) -> Reading:
             return Reading(
                 ok=False, present=True, status="battery_unavailable",
                 source=source,
-                detail=("XInput 未提供可靠电量；蓝牙连接可能不支持，"
-                        "建议使用 Xbox 无线适配器"))
+                detail=("XInput 暂未提供可靠电量；程序会自动重试，"
+                        "如持续无数据建议使用 Xbox 无线适配器"),
+                xinput_slot=slot)
         raw_level = int(info.BatteryLevel)
         if raw_level not in XINPUT_LEVEL_PERCENT:
             return Reading(
@@ -5943,6 +5965,9 @@ class TrayApp:
         self._refresh_event = threading.Event()
         self._worker_thread = None
         self._worker_start_lock = threading.Lock()
+        self._xinput_retry_at = 0.0
+        self._xinput_retry_delay = 1.0
+        self._xinput_retry_count = 0
         self._stop = False
         self.tray: Optional[Tray] = None
         self.panel: Optional[Panel] = None
@@ -6069,11 +6094,26 @@ class TrayApp:
                 self._readings = res
             self._check_full(res)
             self._check_low_battery(res)
+            self._schedule_xinput_retry(res)
             if self.tray and self.tray.hwnd:
                 user32.PostMessageW(self.tray.hwnd, WM_APP_REFRESH, 0, 0)
         finally:
             self._refreshing = False
             self._dirty = True
+
+    def _schedule_xinput_retry(self, res):
+        """手柄未及时上报电池时快速退避重试，成功后恢复正常刷新周期。"""
+        needs_retry = any(
+            r.status == "battery_unavailable" and r.xinput_slot is not None
+            for r in res.values())
+        if needs_retry and self._xinput_retry_count < 5:
+            self._xinput_retry_at = time.monotonic() + self._xinput_retry_delay
+            self._xinput_retry_delay = min(self._xinput_retry_delay * 2, 15.0)
+            self._xinput_retry_count += 1
+        else:
+            self._xinput_retry_at = 0.0
+            self._xinput_retry_delay = 1.0
+            self._xinput_retry_count = 0
 
     def _check_full(self, res):
         """电量首?100% 时弹?Windows 通知；掉?97% 以下重新布防?"""
@@ -6279,6 +6319,11 @@ class TrayApp:
             if self._show_requested:
                 self._show_requested = False
                 self.panel.show()
+            if (self._xinput_retry_at and
+                    time.monotonic() >= self._xinput_retry_at and
+                    not self._refreshing):
+                self._xinput_retry_at = 0.0
+                self.refresh()
             if self._dirty:
                 self._dirty = False
                 if self.root.winfo_viewable():
