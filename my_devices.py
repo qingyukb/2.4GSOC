@@ -585,14 +585,148 @@ class Reading:
     usage_page: int = 0
     hid_known: bool = False
     dpi_config: Optional[DpiConfig] = None
+    xinput_level: Optional[int] = None
+    xinput_slot: Optional[int] = None
 
     @property
     def text(self) -> str:
-        return f"{self.level}%" if self.ok and self.level is not None else "未连接"
+        if self.ok and self.level is not None:
+            return f"{self.level}%"
+        if self.status == "battery_unavailable":
+            return "无电量数据"
+        if self.status == "asleep":
+            return "休眠"
+        return "未连接"
 
 
 STATUS_TEXT = {"charging": "充电中", "discharging": "放电中",
-               "full": "已充满", "wired": "有线模式", "unknown": "未知"}
+               "full": "已充满", "wired": "有线模式",
+               "xinput_full": "四档满", "xinput_medium": "四档中",
+               "xinput_low": "低电量", "xinput_empty": "即将耗尽",
+               "battery_unavailable": "无电量数据", "unknown": "未知"}
+
+
+# ===========================================================================
+# Windows XInput（Xbox 手柄）
+# ===========================================================================
+XINPUT_BATTERY_DEVTYPE_GAMEPAD = 0
+XINPUT_BATTERY_TYPE_DISCONNECTED = 0
+XINPUT_BATTERY_TYPE_WIRED = 1
+XINPUT_BATTERY_TYPE_ALKALINE = 2
+XINPUT_BATTERY_TYPE_NIMH = 3
+XINPUT_BATTERY_TYPE_UNKNOWN = 4
+XINPUT_BATTERY_LEVEL_EMPTY = 0
+XINPUT_BATTERY_LEVEL_LOW = 1
+XINPUT_BATTERY_LEVEL_MEDIUM = 2
+XINPUT_BATTERY_LEVEL_FULL = 3
+ERROR_DEVICE_NOT_CONNECTED = 1167
+
+XINPUT_LEVEL_PERCENT = {0: 5, 1: 30, 2: 70, 3: 100}
+XINPUT_LEVEL_STATUS = {
+    0: "xinput_empty", 1: "xinput_low",
+    2: "xinput_medium", 3: "xinput_full",
+}
+XINPUT_LEVEL_TEXT = {0: "空", 1: "低", 2: "中", 3: "满"}
+XINPUT_TYPE_TEXT = {
+    XINPUT_BATTERY_TYPE_WIRED: "有线",
+    XINPUT_BATTERY_TYPE_ALKALINE: "碱性电池",
+    XINPUT_BATTERY_TYPE_NIMH: "镍氢电池",
+}
+
+
+class XINPUT_BATTERY_INFORMATION(ctypes.Structure):
+    _fields_ = [("BatteryType", ctypes.c_ubyte),
+                ("BatteryLevel", ctypes.c_ubyte)]
+
+
+_XINPUT_DLL = None
+_XINPUT_LOAD_TRIED = False
+
+
+def _xinput_dll():
+    """延迟加载 XInput，避免没有 Xbox 手柄时占用额外资源。"""
+    global _XINPUT_DLL, _XINPUT_LOAD_TRIED
+    if _XINPUT_LOAD_TRIED:
+        return _XINPUT_DLL
+    _XINPUT_LOAD_TRIED = True
+    for name in ("xinput1_4", "xinput1_3", "xinput9_1_0"):
+        try:
+            lib = ctypes.WinDLL(name)
+            state_func = lib.XInputGetState
+            state_func.argtypes = [wt.DWORD, ctypes.c_void_p]
+            state_func.restype = wt.DWORD
+            func = lib.XInputGetBatteryInformation
+            func.argtypes = [wt.DWORD, ctypes.c_ubyte,
+                             ctypes.POINTER(XINPUT_BATTERY_INFORMATION)]
+            func.restype = wt.DWORD
+            _XINPUT_DLL = lib
+            break
+        except (OSError, AttributeError):
+            continue
+    return _XINPUT_DLL
+
+
+def xbox_read_xinput(_iface: Optional[HidIface] = None) -> Reading:
+    """读取 XInput 四档电量；XInput 不提供精确百分比和充电状态。"""
+    lib = _xinput_dll()
+    source = "Windows XInput（四档电量）"
+    if lib is None:
+        return Reading(ok=False, present=True, source=source,
+                       detail="当前系统找不到 XInput 接口")
+    last_error = 0
+    for slot in range(4):
+        state = (ctypes.c_ubyte * 16)()
+        state_code = int(lib.XInputGetState(slot, ctypes.byref(state)))
+        info = XINPUT_BATTERY_INFORMATION()
+        code = int(lib.XInputGetBatteryInformation(
+            slot, XINPUT_BATTERY_DEVTYPE_GAMEPAD, ctypes.byref(info)))
+        if state_code != 0 and code == ERROR_DEVICE_NOT_CONNECTED:
+            continue
+        if state_code == 0 and code != 0:
+            return Reading(
+                ok=False, present=True, status="battery_unavailable",
+                source=source,
+                detail=(f"XInput 槽位 {slot + 1}；手柄已连接，"
+                        f"但电池接口返回错误码 {code}"))
+        if code != 0:
+            last_error = code
+            continue
+        battery_type = int(info.BatteryType)
+        if battery_type == XINPUT_BATTERY_TYPE_DISCONNECTED:
+            if state_code == 0:
+                return Reading(
+                    ok=False, present=True, status="battery_unavailable",
+                    source=source,
+                    detail=(f"XInput 槽位 {slot + 1}；手柄已连接，"
+                            "但当前电池组未上报电量（兼容性限制）"))
+            continue
+        if battery_type == XINPUT_BATTERY_TYPE_WIRED:
+            return Reading(
+                ok=True, level=100, status="wired", source=source,
+                detail=f"XInput 槽位 {slot + 1}；有线连接，不提供电池百分比")
+        if battery_type == XINPUT_BATTERY_TYPE_UNKNOWN:
+            return Reading(
+                ok=False, present=True, status="battery_unavailable",
+                source=source,
+                detail=("XInput 未提供可靠电量；蓝牙连接可能不支持，"
+                        "建议使用 Xbox 无线适配器"))
+        raw_level = int(info.BatteryLevel)
+        if raw_level not in XINPUT_LEVEL_PERCENT:
+            return Reading(
+                ok=False, present=True, source=source,
+                detail=f"XInput 返回未知电量档位 {raw_level}")
+        level = XINPUT_LEVEL_PERCENT[raw_level]
+        battery_text = XINPUT_TYPE_TEXT.get(battery_type, "无线电池")
+        return Reading(
+            ok=True, level=level, status=XINPUT_LEVEL_STATUS[raw_level],
+            source=source,
+            detail=(f"XInput 槽位 {slot + 1}；{battery_text}；"
+                    f"四档电量={XINPUT_LEVEL_TEXT[raw_level]}"
+                    "（非精确百分比）"),
+            xinput_level=raw_level, xinput_slot=slot)
+    detail = (f"XInput 返回错误码 {last_error}" if last_error else
+              "XInput 暂未返回手柄电量，轻按手柄按键后重试")
+    return Reading(ok=False, present=True, source=source, detail=detail)
 
 
 def _clamp(v, lo=0, hi=100):
@@ -1310,6 +1444,21 @@ BUILTIN_PROTOCOLS = {
     },
 }
 
+# Xbox 控制器通过系统 XInput 接口读取；PID 列表覆盖常见 Xbox One/Series
+# 控制器及使用微软协议兼容模式的第三方手柄。未知 PID 仍可通过 HID 常规方式添加，
+# 但只有 XInput 能提供电量的型号需要在此登记。
+XBOX_XINPUT_PIDS = (
+    0x02D1, 0x02DD, 0x02E3, 0x02EA, 0x02FD,
+    0x0B00, 0x0B05, 0x0B0A, 0x0B12, 0x0B13, 0x0B20,
+)
+for _xbox_pid in XBOX_XINPUT_PIDS:
+    BUILTIN_PROTOCOLS.setdefault((0x045E, _xbox_pid), {
+        "name": "Xbox 控制器",
+        "usage_page": 0x0001,
+        "reader": xbox_read_xinput,
+        "type": "gamepad",
+    })
+
 
 DEVICE_TYPES = (
     ("mouse", "鼠标"),
@@ -1332,6 +1481,11 @@ def infer_device_type(vid: int, pid: int, name: str = "") -> str:
         return "keyboard"
     if pair in DEVICES[1].ids:
         return "headset"
+    profile = BUILTIN_PROTOCOLS.get(pair)
+    if profile and profile.get("type"):
+        return str(profile["type"])
+    if pair[0] == 0x045E:
+        return "gamepad"
     text = (name or "").lower()
     aliases = (
         ("gamepad", ("手柄", "gamepad", "controller", "xbox")),
@@ -1590,7 +1744,7 @@ def read_saved_device(dev: dict, ifaces=None) -> Reading:
         if has_builtin_protocol(vid, pid):
             try:
                 rr = read_builtin_protocol(cand, vid, pid)
-                if rr and rr.ok:
+                if rr and (rr.ok or rr.status == "battery_unavailable"):
                     r = rr
             except Exception:
                 pass
@@ -1612,7 +1766,7 @@ def read_saved_device(dev: dict, ifaces=None) -> Reading:
             status="asleep" if supported else "unknown_proto",
             detail=("设备休眠" if supported
                     else "协议未知，无法读取电量"))
-    elif not r.ok and supported:
+    elif not r.ok and supported and r.status != "battery_unavailable":
         r.status = "asleep"
         if has_builtin_protocol(vid, pid):
             r.source = f"{BUILTIN_PROTOCOLS[(vid, pid)]['name']} 内置协议"
@@ -1769,12 +1923,15 @@ def apply_last_known(res: dict[str, Reading]) -> dict[str, Reading]:
                          "source": r.source, "status": r.status,
                          "vid": r.vid, "pid": r.pid,
                          "usage_page": r.usage_page,
-                         "hid_known": r.hid_known}
+                         "hid_known": r.hid_known,
+                         "xinput_level": r.xinput_level,
+                         "xinput_slot": r.xinput_slot}
             changed = True
             out[key] = r
             continue
         if ((not r.ok) and key in last
-                and r.status not in ("unknown_proto", "unplugged")):
+                and r.status not in ("unknown_proto", "unplugged",
+                                     "battery_unavailable")):
             item = last[key]
             try:
                 level = int(item.get("level"))
@@ -1794,6 +1951,18 @@ def apply_last_known(res: dict[str, Reading]) -> dict[str, Reading]:
                 out[key].pid = int(item.get("pid", 0) or 0)
                 out[key].usage_page = int(item.get("usage_page", 0) or 0)
                 out[key].hid_known = bool(item.get("hid_known", False))
+                xinput_level = item.get("xinput_level")
+                if xinput_level is not None:
+                    try:
+                        out[key].xinput_level = int(xinput_level)
+                    except (TypeError, ValueError):
+                        pass
+                xinput_slot = item.get("xinput_slot")
+                if xinput_slot is not None:
+                    try:
+                        out[key].xinput_slot = int(xinput_slot)
+                    except (TypeError, ValueError):
+                        pass
                 out[key].dpi_config = r.dpi_config
                 continue
         out[key] = r
@@ -4966,6 +5135,11 @@ class Panel:
                 "wired": ("有线模式", self.DSH_ACCENT),
                 "discharging": ("电池供电", self.DSH_SUB),
                 "asleep": ("设备休眠", self.DSH_WARN),
+                "xinput_full": ("四档满", self.DSH_OK),
+                "xinput_medium": ("四档中", self.DSH_ACCENT),
+                "xinput_low": ("四档低", self.DSH_WARN),
+                "xinput_empty": ("即将耗尽", self.DSH_ERROR),
+                "battery_unavailable": ("无电量数据", self.DSH_WARN),
             }.get(status, ("", self.DSH_MUTED))
         if not label:
             return
@@ -5103,6 +5277,8 @@ class Panel:
             hint_text, hint_col = r.detail or "上次更新", self.DSH_WARN
         elif r.status == "asleep":
             hint_text, hint_col = r.detail or "设备休眠", self.DSH_MUTED
+        elif r.status == "battery_unavailable":
+            hint_text, hint_col = r.detail or "电池组未上报电量", self.DSH_WARN
         elif unknown:
             hint_text, hint_col = "协议未知 · 点我解决", self.DSH_WARN
         max_hint_w = max(10, x2 - 22 - (type_right + 10))
@@ -5133,6 +5309,9 @@ class Panel:
         elif r.status == "asleep":
             cv.create_text(x2 - 23, y1 + 34, text="休眠", anchor="e",
                            fill=_rgb(self.DSH_MUTED), font=self._f(14, True))
+        elif r.status == "battery_unavailable":
+            cv.create_text(x2 - 23, y1 + 34, text="无数据", anchor="e",
+                           fill=_rgb(self.DSH_WARN), font=self._f(14, True))
         elif not unknown:
             cv.create_text(x2 - 23, y1 + 34, text="未连接", anchor="e",
                            fill=_rgb(self.DSH_MUTED), font=self._f(14, True))
@@ -5516,7 +5695,7 @@ class Tray:
         self.enabled = True
         self.taskbar_created = user32.RegisterWindowMessageW("TaskbarCreated")
         self._wndproc = WNDPROC(self._proc)
-        self._big_icon = 0
+        self._notice_icons: dict[tuple, int] = {}
 
     def start(self):
         self.thread = threading.Thread(target=self._run, daemon=True)
@@ -5619,6 +5798,8 @@ class Tray:
                     parts.append(f"{name} {r.level}%{suffix}")
                 elif r.status == "asleep":
                     parts.append(f"{name} 休眠")
+                elif r.status == "battery_unavailable":
+                    parts.append(f"{name} 已连接·无电量数据")
                 else:
                     parts.append(f"{name} 未连接")
             tip = "\n".join(parts)
@@ -5654,22 +5835,29 @@ class Tray:
         finally:
             user32.DestroyMenu(menu)
 
-    def notify(self, text: str, title: str = "2.4G") -> bool:
-        """托盘气泡通知（Windows 通知丿也会收到），?64px 满绿玁图标?"""
+    def notify(self, text: str, title: str = "2.4G",
+               level: Optional[int] = 100, charging: bool = False) -> bool:
+        """显示托盘气泡；图标颜色跟随当前电量。"""
         nid = self.nids.get(1)
         if nid is None:
             return False
-        if not self._big_icon:
-            self._big_icon = make_battery_icon(100, self.app.theme_light,
-                                               False, size=64)
+        icon_key = (None if level is None else max(0, min(100, int(level))) // 10,
+                    self.app.theme_light, bool(charging))
+        notice_icon = self._notice_icons.get(icon_key)
+        if not notice_icon:
+            notice_icon = make_battery_icon(
+                level, self.app.theme_light, charging, size=64)
+            if notice_icon:
+                self._notice_icons[icon_key] = notice_icon
         old_icon = nid.hIcon
-        if self._big_icon:
-            nid.hIcon = self._big_icon
+        if notice_icon:
+            nid.hIcon = notice_icon
         nid.uFlags = NIF_INFO | NIF_ICON
-        nid.uVersion = 10000          # 10 ?        nid.szInfo = text[:255]
+        nid.uVersion = 10000
+        nid.szInfo = text[:255]
         nid.szInfoTitle = title[:63]
         nid.dwInfoFlags = NIIF_USER | NIIF_LARGE_ICON
-        nid.hBalloonIcon = self._big_icon
+        nid.hBalloonIcon = notice_icon
         ok = shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(nid))
         nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
         nid.hIcon = old_icon
@@ -5683,9 +5871,10 @@ class Tray:
         for h in list(self.icons.values()):
             user32.DestroyIcon(h)
         self.icons.clear()
-        if self._big_icon:
-            user32.DestroyIcon(self._big_icon)
-            self._big_icon = 0
+        for icon in self._notice_icons.values():
+            if icon:
+                user32.DestroyIcon(icon)
+        self._notice_icons.clear()
 
     def _proc(self, hwnd, msg, wparam, lparam):
         if msg == WM_TRAYICON:
@@ -5760,6 +5949,7 @@ class TrayApp:
         self._dirty = False
         self._show_requested = False
         self._full: dict[str, bool] = {}
+        self._low: dict[str, bool] = {}
         self.devices = load_saved_devices()
         self._seen = None
         self._asked = set()
@@ -5878,6 +6068,7 @@ class TrayApp:
             with self._lock:
                 self._readings = res
             self._check_full(res)
+            self._check_low_battery(res)
             if self.tray and self.tray.hwnd:
                 user32.PostMessageW(self.tray.hwnd, WM_APP_REFRESH, 0, 0)
         finally:
@@ -5894,11 +6085,46 @@ class TrayApp:
                     self._full[key] = True
                     if self.tray:
                         try:
-                            self.tray.notify(f"{r.name} 已经充满电啦")
+                            self.tray.notify(f"{r.name} 已经充满电啦",
+                                             level=100)
                         except Exception:
                             pass
             elif r.level < 97:
                 self._full[key] = False
+
+    def _check_low_battery(self, res):
+        """低于 20% 时提醒一次；充电或恢复到 25% 后重新布防。"""
+        warnings = []
+        lowest = None
+        for key, r in res.items():
+            if not r.ok or r.level is None or r.stale or not r.present:
+                continue
+            if r.status in ("charging", "full", "wired"):
+                self._low[key] = False
+                continue
+            level = max(0, min(100, int(r.level)))
+            if level < 20:
+                if self._low.get(key):
+                    continue
+                self._low[key] = True
+                name = r.name or "设备"
+                if r.status == "xinput_empty":
+                    message = f"{name} 电量即将耗尽（XInput 档位约 5%）"
+                elif r.status in ("xinput_low", "xinput_medium"):
+                    message = f"{name} 电量偏低（XInput 档位约 {level}%）"
+                else:
+                    message = f"{name} 电量仅剩 {level}%，建议尽快充电"
+                warnings.append(message)
+                lowest = level if lowest is None else min(lowest, level)
+            elif level >= 25:
+                self._low[key] = False
+        if warnings and self.tray:
+            text = (warnings[0] if len(warnings) == 1
+                    else "以下设备电量较低：\n" + "\n".join(warnings))
+            try:
+                self.tray.notify(text[:255], "低电量提醒", level=lowest)
+            except Exception:
+                pass
 
     # -- 交互 --------------------------------------------------------------
     def request_show(self):
