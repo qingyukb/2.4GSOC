@@ -1,20 +1,42 @@
+# Python 旧实现已移除，防止误提交遗留文件
 __pycache__/
 *.py[cod]
 *.pyo
+*.py
+*.spec
 
-# 本地备份与开发产物
+# C++ 构建产物
+build/
+dist/
+release/
+out/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+CMakeUserPresets.json
+*.obj
+*.res
+*.exe
+*.dll
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.map
+
+# 本地调试与备份
 backups/
 feedback/
 feedback_logs.zip
 capture_states/
-my_devices.corrupt.py
-my_devices_recovered.pyc
-dist/
-build/
-*.spec
-release/
+docs/ui-concepts/
+native/*.png
+native/*.ps1
 *.log
 
-# 系统
+# 系统文件
 Thumbs.db
 desktop.ini
+
+# RC 资源编译时生成的临时 manifest
+native/embedded.manifest
